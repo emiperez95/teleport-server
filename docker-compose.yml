@@ -1,0 +1,48 @@
+version: '3.8'
+
+services:
+  teleport-server:
+    build: .
+    container_name: claude-teleport-server
+    ports:
+      - "8080:8080"       # Teleport API
+      - "2222:22"         # SSH (mapped to avoid conflict with host)
+      - "3284-3300:3284-3300"  # AgentAPI ports for sessions
+    volumes:
+      - claude-data:/claude-data    # Persistent config: ~/.claude, ~/.config/gh, etc.
+      - projects:/projects           # Git repositories
+    environment:
+      - NODE_ENV=production
+      - TELEPORT_PORT=8080
+      - AGENTAPI_BASE_PORT=3284
+      - MAX_SESSIONS=16              # Maximum concurrent sessions
+      - SESSION_TIMEOUT_HOURS=24     # Auto-kill idle sessions after this time
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+    restart: unless-stopped
+    # Resource limits per container
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+        reservations:
+          memory: 2G
+
+volumes:
+  claude-data:
+    driver: local
+  projects:
+    driver: local
+
+# For development, you can override with docker-compose.override.yml:
+# version: '3.8'
+# services:
+#   teleport-server:
+#     build:
+#       context: .
+#       dockerfile: Dockerfile.dev
+#     volumes:
+#       - ./src:/app/src:ro
+#       - claude-data:/claude-data
+#       - projects:/projects
+#     environment:
+#       - NODE_ENV=development
