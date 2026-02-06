@@ -128,8 +128,67 @@ curl localhost:8080/health
 - **/claude-data**: Persistent config (~/.claude, ~/.config/gh, ~/.ssh)
 - **/projects**: Git repositories
 
+## Request/Response Schemas
+
+### POST /teleport Request
+```typescript
+{
+  repo_url: string;           // Git clone URL (required)
+  branch?: string;            // Branch to checkout (default: main)
+  claude_config?: {
+    mcp?: { mcpServers: Record<string, McpServerConfig> };
+    settings?: Record<string, unknown>;
+    permissions?: { allow?: string[]; deny?: string[] };
+  };
+  env_vars?: Record<string, string>;
+  initial_prompt?: string;    // First message to send to Claude
+}
+```
+
+### POST /teleport Response
+```typescript
+{
+  session_id: string;
+  agent_port: number;         // AgentAPI port (3284+)
+  status: 'starting' | 'running' | 'stable' | 'error' | 'stopped';
+  work_dir: string;           // Path to cloned repo
+}
+```
+
+## Roadmap
+
+### Phase 1: Core Container (MVP) ← CURRENT
+- [x] Dockerfile with all dependencies
+- [x] Express API (teleport, sessions, health)
+- [x] Session management (tmux + port allocation)
+- [x] Git clone/pull/push
+- [x] SSH access for CLI auth
+- [ ] Test Docker build and run
+- [ ] Verify Claude API mode works
+
+### Phase 2: Enhanced Features
+- [ ] Conversation history preservation
+- [ ] MCP configuration per-session
+- [ ] Git push on session end
+- [ ] Web UI for session management
+
+### Phase 3: Client CLI
+- [ ] `claude-teleport send` - send current session to server
+- [ ] `claude-teleport attach` - connect to remote session
+- [ ] `claude-teleport pull` - pull session back to local
+
+## Current Status
+
+**Phase 1 MVP built, not yet tested.** Next step: `npm install && npm run build && docker compose build`
+
 ## Known Limitations
 
 - No authentication (relies on network security/VPN)
-- Claude `--api` mode is placeholder (needs actual AgentAPI binary)
+- Claude `--api` mode is placeholder (needs actual AgentAPI binary or different approach)
 - Single container, multiple sessions via tmux (not k8s pods)
+
+## Open Questions
+
+1. **Claude API mode**: Does `claude --api` exist? May need to use headless mode or different approach
+2. **Max sessions**: 16 default - resource limits per session TBD
+3. **Session timeout**: Auto-kill after 24h idle - configurable via env var
