@@ -5,6 +5,10 @@ export interface TeleportRequest {
   env_vars?: Record<string, string>;
   conversation?: ConversationState;
   initial_prompt?: string;
+  session_data?: string;       // base64-encoded JSONL session file
+  resume_session_id?: string;  // Claude session ID to resume
+  diff_patch?: string;         // base64-encoded git diff (uncommitted changes)
+  claude_md?: string;          // base64-encoded CLAUDE.md content
 }
 
 export interface ClaudeConfig {
@@ -45,11 +49,9 @@ export interface Session {
   repo_url: string;
   branch: string;
   status: SessionStatus;
-  port: number;
   tmux_session: string;
   created_at: Date;
   last_activity?: Date;
-  pid?: number;
   work_dir: string;
 }
 
@@ -59,14 +61,14 @@ export interface SessionListItem {
   id: string;
   project: string;
   status: SessionStatus;
-  port: number;
+  tmux_session: string;
   created_at: string;
   last_activity?: string;
 }
 
 export interface TeleportResponse {
   session_id: string;
-  agent_port: number;
+  tmux_session: string;
   status: SessionStatus;
   work_dir: string;
 }
@@ -75,5 +77,4 @@ export interface SessionDetails extends SessionListItem {
   repo_url: string;
   branch: string;
   work_dir: string;
-  tmux_session: string;
 }

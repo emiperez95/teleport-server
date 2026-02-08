@@ -18,9 +18,6 @@ router.get('/', async (_req: Request, res: Response) => {
       active: sessionManager.getSessionCount(),
       tmux: tmuxSessions.length,
     },
-    ports: {
-      used: agentApiService.getUsedPorts(),
-    },
   });
 });
 

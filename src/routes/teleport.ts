@@ -36,7 +36,7 @@ router.post('/', async (req: Request, res: Response) => {
 
     const response: TeleportResponse = {
       session_id: session.id,
-      agent_port: session.port,
+      tmux_session: session.tmux_session,
       status: session.status,
       work_dir: session.work_dir,
     };

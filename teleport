@@ -1,0 +1,361 @@
+#!/usr/bin/env bash
+# teleport - CLI wrapper for Claude Teleport Server
+
+set -euo pipefail
+
+HOST="${TELEPORT_HOST:-localhost}"
+PORT="${TELEPORT_PORT:-8080}"
+SSH_PORT="${TELEPORT_SSH_PORT:-2222}"
+SSH_USER="${TELEPORT_SSH_USER:-claude}"
+BASE_URL="http://${HOST}:${PORT}"
+
+usage() {
+  cat <<EOF
+Usage: teleport <command> [options]
+
+Commands:
+  setup                      Configure Claude auth, GitHub, git in container
+  send <repo_url> [branch]   Create a session from a git repo
+  beam                       Send current Claude session to the server
+  list                       List all active sessions
+  info <session_id>          Get session details
+  attach <session_id>        SSH in and attach to a session's tmux
+  kill <session_id>          Kill a session
+  push <session_id> [msg]    Commit and push changes
+  health                     Health check
+
+Environment:
+  TELEPORT_HOST       Server host (default: localhost)
+  TELEPORT_PORT       API port (default: 8080)
+  TELEPORT_SSH_PORT   SSH port (default: 2222)
+  TELEPORT_SSH_USER   SSH user (default: claude)
+EOF
+  exit 1
+}
+
+cmd_send() {
+  local repo_url="${1:?Usage: teleport send <repo_url> [branch]}"
+  local branch="${2:-}"
+  local body
+
+  if [ -n "$branch" ]; then
+    body=$(printf '{"repo_url":"%s","branch":"%s"}' "$repo_url" "$branch")
+  else
+    body=$(printf '{"repo_url":"%s"}' "$repo_url")
+  fi
+
+  _do_teleport "$body"
+}
+
+cmd_beam() {
+  # Auto-detect everything from the current git project
+
+  # Track temp files for cleanup
+  declare -a tmpfiles
+  _beam_cleanup() { [ "${#tmpfiles[@]}" -gt 0 ] && rm -f "${tmpfiles[@]}" 2>/dev/null || true; }
+  trap _beam_cleanup RETURN
+
+  # 1. Get repo URL (convert SSH to HTTPS for container compatibility)
+  local repo_url
+  repo_url=$(git remote get-url origin 2>/dev/null) || {
+    echo "Error: Not in a git repository or no 'origin' remote"
+    exit 1
+  }
+  # Convert git@github.com:user/repo.git → https://github.com/user/repo.git
+  if [[ "$repo_url" == git@github.com:* ]]; then
+    repo_url="https://github.com/${repo_url#git@github.com:}"
+  fi
+
+  # 2. Get current branch
+  local branch
+  branch=$(git branch --show-current 2>/dev/null) || branch="main"
+
+  # 3. Find the project root
+  local project_dir
+  project_dir=$(git rev-parse --show-toplevel 2>/dev/null) || {
+    echo "Error: Cannot determine project root"
+    exit 1
+  }
+
+  # Claude stores sessions at ~/.claude/projects/<path-hash>/
+  local path_hash
+  path_hash=$(echo "$project_dir" | sed 's|/|-|g')
+  local sessions_dir="$HOME/.claude/projects/${path_hash}"
+
+  echo "Detected:"
+  echo "  Repo:    $repo_url"
+  echo "  Branch:  $branch"
+  echo "  Project: $project_dir"
+
+  # 4. Find the most recent session file
+  local session_file=""
+  local resume_session_id=""
+
+  if [ -d "$sessions_dir" ]; then
+    session_file=$(ls -t "$sessions_dir"/*.jsonl 2>/dev/null | head -1) || true
+  fi
+
+  if [ -n "$session_file" ]; then
+    resume_session_id=$(basename "$session_file" .jsonl)
+    local session_size
+    session_size=$(du -h "$session_file" | cut -f1)
+    echo "  Session: $resume_session_id ($session_size)"
+  else
+    echo "  Session: (none, starting fresh)"
+  fi
+
+  # 5. Uncommitted changes (staged + unstaged vs HEAD)
+  local has_diff=false
+  local diff_b64_file=""
+  local diff_output
+  diff_output=$(cd "$project_dir" && git diff HEAD 2>/dev/null) || true
+  if [ -n "$diff_output" ]; then
+    diff_b64_file=$(mktemp)
+    tmpfiles+=("$diff_b64_file")
+    echo "$diff_output" | base64 > "$diff_b64_file"
+    has_diff=true
+    local diff_lines
+    diff_lines=$(echo "$diff_output" | wc -l | tr -d ' ')
+    echo "  Changes: $diff_lines lines of diff"
+  else
+    echo "  Changes: (clean)"
+  fi
+
+  # 6. CLAUDE.md from project root
+  local has_claude_md=false
+  local claude_md_b64_file=""
+  if [ -f "$project_dir/CLAUDE.md" ]; then
+    claude_md_b64_file=$(mktemp)
+    tmpfiles+=("$claude_md_b64_file")
+    base64 < "$project_dir/CLAUDE.md" > "$claude_md_b64_file"
+    has_claude_md=true
+    local md_size
+    md_size=$(du -h "$project_dir/CLAUDE.md" | cut -f1)
+    echo "  CLAUDE.md: yes ($md_size)"
+  else
+    echo "  CLAUDE.md: (not found)"
+  fi
+
+  # 7. .claude/ project config (settings, permissions, MCP)
+  local has_config=false
+  local config_json=""
+  if [ -d "$project_dir/.claude" ]; then
+    # settings.local.json → claude_config.settings + permissions
+    if [ -f "$project_dir/.claude/settings.local.json" ]; then
+      config_json=$(jq -n --slurpfile s "$project_dir/.claude/settings.local.json" '{settings: $s[0]}')
+      # Extract permissions if nested inside settings
+      local perms
+      perms=$(jq '.permissions // empty' "$project_dir/.claude/settings.local.json" 2>/dev/null) || true
+      if [ -n "$perms" ] && [ "$perms" != "null" ]; then
+        config_json=$(echo "$config_json" | jq --argjson p "$perms" '. + {permissions: $p}')
+      fi
+      has_config=true
+    fi
+    # mcp.json
+    if [ -f "$project_dir/.claude/mcp.json" ]; then
+      if [ -n "$config_json" ]; then
+        config_json=$(echo "$config_json" | jq --slurpfile m "$project_dir/.claude/mcp.json" '. + {mcp: $m[0]}')
+      else
+        config_json=$(jq -n --slurpfile m "$project_dir/.claude/mcp.json" '{mcp: $m[0]}')
+      fi
+      has_config=true
+    fi
+    if [ "$has_config" = true ]; then
+      echo "  Config:   .claude/ settings included"
+    fi
+  fi
+
+  echo ""
+  echo "Beaming to server..."
+
+  # Build JSON body incrementally
+  local body_file
+  body_file=$(mktemp)
+  tmpfiles+=("$body_file")
+
+  # Start with base fields
+  jq -n --arg repo "$repo_url" --arg branch "$branch" \
+    '{repo_url: $repo, branch: $branch}' > "$body_file"
+
+  # Add session data if found
+  if [ -n "$session_file" ]; then
+    local session_b64_file
+    session_b64_file=$(mktemp)
+    tmpfiles+=("$session_b64_file")
+    base64 < "$session_file" > "$session_b64_file"
+
+    jq --rawfile data "$session_b64_file" --arg sid "$resume_session_id" \
+      '. + {session_data: ($data | gsub("\n";"")), resume_session_id: $sid}' \
+      "$body_file" > "${body_file}.tmp" && mv "${body_file}.tmp" "$body_file"
+  fi
+
+  # Add diff patch
+  if [ "$has_diff" = true ]; then
+    jq --rawfile patch "$diff_b64_file" \
+      '. + {diff_patch: ($patch | gsub("\n";""))}' \
+      "$body_file" > "${body_file}.tmp" && mv "${body_file}.tmp" "$body_file"
+  fi
+
+  # Add CLAUDE.md
+  if [ "$has_claude_md" = true ]; then
+    jq --rawfile md "$claude_md_b64_file" \
+      '. + {claude_md: ($md | gsub("\n";""))}' \
+      "$body_file" > "${body_file}.tmp" && mv "${body_file}.tmp" "$body_file"
+  fi
+
+  # Add claude_config
+  if [ "$has_config" = true ]; then
+    jq --argjson conf "$config_json" \
+      '. + {claude_config: $conf}' \
+      "$body_file" > "${body_file}.tmp" && mv "${body_file}.tmp" "$body_file"
+  fi
+
+  _do_teleport_file "$body_file"
+}
+
+_do_teleport_file() {
+  local body_file="$1"
+
+  local response
+  response=$(curl -s -X POST "${BASE_URL}/teleport" \
+    -H 'Content-Type: application/json' \
+    --data-binary "@${body_file}")
+
+  _show_result "$response"
+}
+
+_do_teleport() {
+  local body="$1"
+
+  local response
+  response=$(curl -s -X POST "${BASE_URL}/teleport" \
+    -H 'Content-Type: application/json' \
+    -d "$body")
+
+  _show_result "$response"
+}
+
+_show_result() {
+  local response="$1"
+
+  local session_id tmux_session work_dir status
+  session_id=$(echo "$response" | jq -r '.session_id // empty')
+
+  if [ -z "$session_id" ]; then
+    echo "Error: $(echo "$response" | jq -r '.error // "Unknown error"')"
+    echo "Details: $(echo "$response" | jq -r '.details // ""')"
+    exit 1
+  fi
+
+  tmux_session=$(echo "$response" | jq -r '.tmux_session')
+  work_dir=$(echo "$response" | jq -r '.work_dir')
+  status=$(echo "$response" | jq -r '.status')
+
+  echo ""
+  echo "Session created:"
+  echo "  ID:     $session_id"
+  echo "  tmux:   $tmux_session"
+  echo "  dir:    $work_dir"
+  echo "  status: $status"
+  echo ""
+  echo "Attach with: teleport attach $session_id"
+}
+
+cmd_list() {
+  local response
+  response=$(curl -s "${BASE_URL}/sessions")
+
+  local count
+  count=$(echo "$response" | jq '.sessions | length')
+
+  if [ "$count" = "0" ]; then
+    echo "No active sessions."
+    return
+  fi
+
+  printf "%-38s %-20s %-10s %s\n" "ID" "PROJECT" "STATUS" "TMUX"
+  echo "$response" | jq -r '.sessions[] | "\(.id) \(.project) \(.status) \(.tmux_session)"' | \
+    while read -r id project status tmux; do
+      printf "%-38s %-20s %-10s %s\n" "$id" "$project" "$status" "$tmux"
+    done
+}
+
+cmd_info() {
+  local session_id="${1:?Usage: teleport info <session_id>}"
+
+  curl -s "${BASE_URL}/sessions/${session_id}" | jq .
+}
+
+cmd_attach() {
+  local session_id="${1:?Usage: teleport attach <session_id>}"
+
+  # Get tmux session name from API
+  local response
+  response=$(curl -s "${BASE_URL}/sessions/${session_id}")
+
+  local tmux_session
+  tmux_session=$(echo "$response" | jq -r '.tmux_session // empty')
+
+  if [ -z "$tmux_session" ]; then
+    echo "Error: Session not found"
+    exit 1
+  fi
+
+  echo "Attaching to $tmux_session..."
+  echo "Password: claude"
+  echo ""
+  ssh -t -p "$SSH_PORT" "${SSH_USER}@${HOST}" "tmux attach -t ${tmux_session}"
+}
+
+cmd_kill() {
+  local session_id="${1:?Usage: teleport kill <session_id>}"
+
+  local response
+  response=$(curl -s -X DELETE "${BASE_URL}/sessions/${session_id}")
+
+  echo "$response" | jq -r '.message // .error'
+}
+
+cmd_push() {
+  local session_id="${1:?Usage: teleport push <session_id> [message]}"
+  local message="${2:-}"
+  local body
+
+  if [ -n "$message" ]; then
+    body=$(printf '{"message":"%s"}' "$message")
+  else
+    body='{}'
+  fi
+
+  curl -s -X POST "${BASE_URL}/sessions/${session_id}/push" \
+    -H 'Content-Type: application/json' \
+    -d "$body" | jq .
+}
+
+cmd_setup() {
+  echo "Connecting to container for setup..."
+  echo "Password: claude"
+  echo ""
+  ssh -t -p "$SSH_PORT" "${SSH_USER}@${HOST}" "sudo bash /app/scripts/setup.sh"
+}
+
+cmd_health() {
+  curl -s "${BASE_URL}/health" | jq .
+}
+
+# Main
+command="${1:-}"
+shift || true
+
+case "$command" in
+  setup)   cmd_setup "$@" ;;
+  send)    cmd_send "$@" ;;
+  beam)    cmd_beam "$@" ;;
+  list|ls) cmd_list "$@" ;;
+  info)    cmd_info "$@" ;;
+  attach)  cmd_attach "$@" ;;
+  kill)    cmd_kill "$@" ;;
+  push)    cmd_push "$@" ;;
+  health)  cmd_health "$@" ;;
+  *)       usage ;;
+esac

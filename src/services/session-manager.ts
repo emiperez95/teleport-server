@@ -1,5 +1,6 @@
 import { v4 as uuidv4 } from 'uuid';
 import { writeFileSync, existsSync, mkdirSync } from 'fs';
+import { execSync } from 'child_process';
 import path from 'path';
 import {
   Session,
@@ -12,7 +13,6 @@ import { gitService } from './git-service.js';
 import { agentApiService } from './agentapi-service.js';
 import { logger } from '../logger.js';
 
-const DATA_DIR = process.env.DATA_DIR || '/claude-data';
 const SESSION_TIMEOUT_HOURS = parseInt(process.env.SESSION_TIMEOUT_HOURS || '24', 10);
 
 export class SessionManager {
@@ -40,6 +40,21 @@ export class SessionManager {
       this.applyClaudeConfig(workDir, request.claude_config);
     }
 
+    // Overwrite CLAUDE.md with local version if provided
+    if (request.claude_md) {
+      this.writeClaudeMd(workDir, request.claude_md);
+    }
+
+    // Apply uncommitted changes as a patch
+    if (request.diff_patch) {
+      this.applyDiffPatch(workDir, request.diff_patch);
+    }
+
+    // Write session data for resume if provided
+    if (request.session_data && request.resume_session_id) {
+      this.writeSessionData(workDir, request.resume_session_id, request.session_data);
+    }
+
     // Extract project name from URL
     const project = this.extractProjectName(request.repo_url);
 
@@ -50,7 +65,6 @@ export class SessionManager {
       repo_url: request.repo_url,
       branch: request.branch || 'main',
       status: 'starting',
-      port: 0,
       tmux_session: tmuxSession,
       created_at: new Date(),
       work_dir: workDir,
@@ -59,19 +73,19 @@ export class SessionManager {
     this.sessions.set(sessionId, session);
 
     try {
-      // Start Claude in tmux with API mode
-      const agentApi = await agentApiService.startInTmux(
+      // Start Claude in tmux
+      await agentApiService.startInTmux(
         tmuxSession,
         workDir,
         request.env_vars,
-        request.initial_prompt
+        request.initial_prompt,
+        request.resume_session_id
       );
 
-      session.port = agentApi.port;
       session.status = 'running';
       session.last_activity = new Date();
 
-      logger.info(`Session ${sessionId} started on port ${session.port}`);
+      logger.info(`Session ${sessionId} started in tmux session ${tmuxSession}`);
     } catch (error) {
       session.status = 'error';
       logger.error(`Failed to start session ${sessionId}: ${error}`);
@@ -96,7 +110,7 @@ export class SessionManager {
       id: s.id,
       project: s.project,
       status: s.status,
-      port: s.port,
+      tmux_session: s.tmux_session,
       created_at: s.created_at.toISOString(),
       last_activity: s.last_activity?.toISOString(),
     }));
@@ -113,13 +127,12 @@ export class SessionManager {
       id: session.id,
       project: session.project,
       status: session.status,
-      port: session.port,
+      tmux_session: session.tmux_session,
       created_at: session.created_at.toISOString(),
       last_activity: session.last_activity?.toISOString(),
       repo_url: session.repo_url,
       branch: session.branch,
       work_dir: session.work_dir,
-      tmux_session: session.tmux_session,
     };
   }
 
@@ -134,7 +147,7 @@ export class SessionManager {
 
     logger.info(`Killing session ${sessionId}`);
 
-    await agentApiService.killSession(session.tmux_session, session.port);
+    await agentApiService.killSession(session.tmux_session);
 
     session.status = 'stopped';
     this.sessions.delete(sessionId);
@@ -207,6 +220,77 @@ export class SessionManager {
       settings.permissions = config.permissions;
       writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
       logger.info('Applied permissions configuration');
+    }
+  }
+
+  /**
+   * Write session data so Claude can resume it.
+   * Session files go to ~/.claude/projects/<path-hash>/<session-id>.jsonl
+   * The path hash is the work dir with / replaced by -
+   */
+  private writeSessionData(workDir: string, resumeSessionId: string, sessionDataB64: string): void {
+    const pathHash = workDir.replace(/\//g, '-');
+    const claudeHome = '/home/claude/.claude';
+    const projectDir = path.join(claudeHome, 'projects', pathHash);
+
+    if (!existsSync(projectDir)) {
+      mkdirSync(projectDir, { recursive: true });
+    }
+
+    const sessionFile = path.join(projectDir, `${resumeSessionId}.jsonl`);
+    const sessionData = Buffer.from(sessionDataB64, 'base64').toString('utf-8');
+    writeFileSync(sessionFile, sessionData);
+
+    // Ensure claude user owns the files
+    execSync(`chown -R claude:claude ${JSON.stringify(projectDir)}`);
+
+    logger.info(`Wrote session data for resume: ${sessionFile} (${sessionData.length} bytes)`);
+  }
+
+  /**
+   * Write CLAUDE.md to the working directory (overrides cloned version)
+   */
+  private writeClaudeMd(workDir: string, claudeMdB64: string): void {
+    const content = Buffer.from(claudeMdB64, 'base64').toString('utf-8');
+    const filePath = path.join(workDir, 'CLAUDE.md');
+    writeFileSync(filePath, content);
+    logger.info(`Wrote CLAUDE.md (${content.length} bytes)`);
+  }
+
+  /**
+   * Apply a git diff patch to the working directory
+   */
+  private applyDiffPatch(workDir: string, diffPatchB64: string): void {
+    const patch = Buffer.from(diffPatchB64, 'base64').toString('utf-8');
+    if (!patch.trim()) {
+      logger.info('Empty diff patch, skipping');
+      return;
+    }
+
+    const patchFile = path.join(workDir, '.teleport-patch.diff');
+    writeFileSync(patchFile, patch);
+
+    try {
+      execSync('git apply --whitespace=nowarn .teleport-patch.diff', {
+        cwd: workDir,
+        timeout: 30000,
+      });
+      logger.info(`Applied diff patch (${patch.length} bytes)`);
+    } catch (error) {
+      logger.warn(`Failed to apply diff patch cleanly, trying with 3-way merge: ${error}`);
+      try {
+        execSync('git apply --3way --whitespace=nowarn .teleport-patch.diff', {
+          cwd: workDir,
+          timeout: 30000,
+        });
+        logger.info('Applied diff patch with 3-way merge');
+      } catch (error2) {
+        logger.error(`Failed to apply diff patch: ${error2}`);
+      }
+    } finally {
+      try {
+        execSync(`rm -f ${JSON.stringify(patchFile)}`);
+      } catch { /* ignore cleanup errors */ }
     }
   }
 

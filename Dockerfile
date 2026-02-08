@@ -33,30 +33,36 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | d
     && apt-get install -y gh \
     && rm -rf /var/lib/apt/lists/*
 
-# Install AWS CLI v2
-RUN curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip" \
+# Install AWS CLI v2 (architecture-aware)
+RUN ARCH=$(dpkg --print-architecture) \
+    && if [ "$ARCH" = "arm64" ] || [ "$ARCH" = "aarch64" ]; then \
+         curl "https://awscli.amazonaws.com/awscli-exe-linux-aarch64.zip" -o "awscliv2.zip"; \
+       else \
+         curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"; \
+       fi \
     && unzip awscliv2.zip \
     && ./aws/install \
     && rm -rf awscliv2.zip aws
 
-# Install jira-cli
-RUN curl -Lo /usr/local/bin/jira https://github.com/ankitpokhrel/jira-cli/releases/latest/download/jira_linux_amd64 \
+# Install jira-cli (architecture-aware)
+RUN ARCH=$(dpkg --print-architecture) \
+    && if [ "$ARCH" = "arm64" ] || [ "$ARCH" = "aarch64" ]; then \
+         curl -Lo /usr/local/bin/jira https://github.com/ankitpokhrel/jira-cli/releases/latest/download/jira_linux_arm64; \
+       else \
+         curl -Lo /usr/local/bin/jira https://github.com/ankitpokhrel/jira-cli/releases/latest/download/jira_linux_amd64; \
+       fi \
     && chmod +x /usr/local/bin/jira
-
-# Install Claude Code CLI globally
-RUN npm install -g @anthropic-ai/claude-code
-
-# Download and install AgentAPI
-# Note: Update URL to official AgentAPI release when available
-ARG AGENTAPI_VERSION=latest
-RUN mkdir -p /opt/agentapi \
-    && echo "AgentAPI will be installed via npm or direct download" \
-    # For now, we'll use claude's built-in agent API via --api flag
-    && echo "Using Claude Code's built-in API mode"
 
 # Create non-root user for running sessions
 RUN useradd -m -s /bin/bash claude \
+    && echo "claude:claude" | chpasswd \
     && echo "claude ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+
+# Install Claude Code CLI via native installer as the claude user
+USER claude
+RUN curl -fsSL https://claude.ai/install.sh | bash
+USER root
+RUN cp /home/claude/.local/bin/claude /usr/local/bin/claude
 
 # Configure SSH
 RUN mkdir /var/run/sshd \
@@ -77,9 +83,11 @@ USER claude
 WORKDIR /home/claude
 
 # Link config directories to persistent volume
-RUN ln -sf /claude-data/.claude /home/claude/.claude \
-    && ln -sf /claude-data/.config /home/claude/.config \
-    && ln -sf /claude-data/.ssh /home/claude/.ssh
+# rm -rf first because the Claude installer creates real dirs
+RUN rm -rf /home/claude/.claude /home/claude/.config /home/claude/.ssh \
+    && ln -s /claude-data/.claude /home/claude/.claude \
+    && ln -s /claude-data/.config /home/claude/.config \
+    && ln -s /claude-data/.ssh /home/claude/.ssh
 
 # Copy application files
 USER root
@@ -99,15 +107,13 @@ RUN chmod +x /app/scripts/*.sh
 # Environment variables
 ENV NODE_ENV=production
 ENV TELEPORT_PORT=8080
-ENV AGENTAPI_BASE_PORT=3284
 ENV PROJECTS_DIR=/projects
 ENV DATA_DIR=/claude-data
 
 # Expose ports
 # 8080: Teleport API
 # 22: SSH
-# 3284-3300: AgentAPI ports for sessions
-EXPOSE 8080 22 3284-3300
+EXPOSE 8080 22
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \

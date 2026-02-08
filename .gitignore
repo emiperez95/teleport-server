@@ -29,5 +29,8 @@ docker-compose.override.yml
 # Test
 coverage/
 
+# Downloaded packages
+*.tgz
+
 # Obsidian symlink
 .obsidian-page.md

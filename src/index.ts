@@ -7,8 +7,8 @@ import { logger } from './logger.js';
 const app = express();
 const PORT = parseInt(process.env.TELEPORT_PORT || '8080', 10);
 
-// Middleware
-app.use(express.json());
+// Middleware — large limit for session data transfers
+app.use(express.json({ limit: '50mb' }));
 
 // Request logging
 app.use((req, res, next) => {
