@@ -3,15 +3,154 @@
 
 set -euo pipefail
 
-HOST="${TELEPORT_HOST:-localhost}"
-PORT="${TELEPORT_PORT:-8080}"
-SSH_PORT="${TELEPORT_SSH_PORT:-2222}"
-SSH_USER="${TELEPORT_SSH_USER:-claude}"
-BASE_URL="http://${HOST}:${PORT}"
+CONFIG_DIR="${HOME}/.teleport"
+HOSTS_FILE="${CONFIG_DIR}/hosts.json"
+
+# ── Host management ──
+
+_ensure_config_dir() {
+  [ -d "$CONFIG_DIR" ] || mkdir -p "$CONFIG_DIR"
+  [ -f "$HOSTS_FILE" ] || echo '{}' > "$HOSTS_FILE"
+}
+
+_get_host_config() {
+  local name="$1"
+  _ensure_config_dir
+  jq -r --arg n "$name" '.[$n] // empty' "$HOSTS_FILE"
+}
+
+_get_default_host() {
+  _ensure_config_dir
+  jq -r '.["_default"] // empty' "$HOSTS_FILE"
+}
+
+_resolve_host() {
+  # Priority: --host flag > env vars > default host > localhost
+  if [ -n "${_HOST_FLAG:-}" ]; then
+    local config
+    config=$(_get_host_config "$_HOST_FLAG")
+    if [ -n "$config" ]; then
+      HOST=$(echo "$config" | jq -r '.host')
+      PORT=$(echo "$config" | jq -r '.port // "8080"')
+      SSH_PORT=$(echo "$config" | jq -r '.ssh_port // "2222"')
+      SSH_USER=$(echo "$config" | jq -r '.ssh_user // "claude"')
+    else
+      # Treat as raw hostname
+      HOST="$_HOST_FLAG"
+      PORT="${TELEPORT_PORT:-8080}"
+      SSH_PORT="${TELEPORT_SSH_PORT:-2222}"
+      SSH_USER="${TELEPORT_SSH_USER:-claude}"
+    fi
+  elif [ -n "${TELEPORT_HOST:-}" ]; then
+    HOST="$TELEPORT_HOST"
+    PORT="${TELEPORT_PORT:-8080}"
+    SSH_PORT="${TELEPORT_SSH_PORT:-2222}"
+    SSH_USER="${TELEPORT_SSH_USER:-claude}"
+  else
+    local default_name
+    default_name=$(_get_default_host)
+    if [ -n "$default_name" ]; then
+      local config
+      config=$(_get_host_config "$default_name")
+      if [ -n "$config" ]; then
+        HOST=$(echo "$config" | jq -r '.host')
+        PORT=$(echo "$config" | jq -r '.port // "8080"')
+        SSH_PORT=$(echo "$config" | jq -r '.ssh_port // "2222"')
+        SSH_USER=$(echo "$config" | jq -r '.ssh_user // "claude"')
+      else
+        HOST="localhost"
+        PORT="8080"
+        SSH_PORT="2222"
+        SSH_USER="claude"
+      fi
+    else
+      HOST="localhost"
+      PORT="8080"
+      SSH_PORT="2222"
+      SSH_USER="claude"
+    fi
+  fi
+  BASE_URL="http://${HOST}:${PORT}"
+}
+
+cmd_host() {
+  local subcmd="${1:-}"
+  shift || true
+
+  case "$subcmd" in
+    add)
+      local name="${1:?Usage: teleport host add <name> <address> [--port PORT] [--ssh-port PORT] [--ssh-user USER]}"
+      local address="${2:?Usage: teleport host add <name> <address>}"
+      shift 2
+      local port="8080" ssh_port="2222" ssh_user="claude"
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --port)     port="$2"; shift 2 ;;
+          --ssh-port) ssh_port="$2"; shift 2 ;;
+          --ssh-user) ssh_user="$2"; shift 2 ;;
+          *)          shift ;;
+        esac
+      done
+      _ensure_config_dir
+      jq --arg n "$name" --arg h "$address" --arg p "$port" --arg sp "$ssh_port" --arg su "$ssh_user" \
+        '.[$n] = {host: $h, port: $p, ssh_port: $sp, ssh_user: $su}' "$HOSTS_FILE" > "${HOSTS_FILE}.tmp" \
+        && mv "${HOSTS_FILE}.tmp" "$HOSTS_FILE"
+      echo "Added host '$name' → $address:$port (ssh: $ssh_port)"
+      ;;
+    remove|rm)
+      local name="${1:?Usage: teleport host remove <name>}"
+      _ensure_config_dir
+      jq --arg n "$name" 'del(.[$n])' "$HOSTS_FILE" > "${HOSTS_FILE}.tmp" \
+        && mv "${HOSTS_FILE}.tmp" "$HOSTS_FILE"
+      echo "Removed host '$name'"
+      ;;
+    default)
+      local name="${1:-}"
+      _ensure_config_dir
+      if [ -z "$name" ]; then
+        local current
+        current=$(_get_default_host)
+        if [ -n "$current" ]; then
+          echo "Default host: $current"
+        else
+          echo "No default host set"
+        fi
+        return
+      fi
+      jq --arg n "$name" '.["_default"] = $n' "$HOSTS_FILE" > "${HOSTS_FILE}.tmp" \
+        && mv "${HOSTS_FILE}.tmp" "$HOSTS_FILE"
+      echo "Default host set to '$name'"
+      ;;
+    list|ls|"")
+      _ensure_config_dir
+      local default_host
+      default_host=$(_get_default_host)
+      local hosts
+      hosts=$(jq -r 'to_entries[] | select(.key != "_default") | .key' "$HOSTS_FILE")
+      if [ -z "$hosts" ]; then
+        echo "No hosts configured. Add one with: teleport host add <name> <address>"
+        return
+      fi
+      printf "%-15s %-25s %-8s %-8s %s\n" "NAME" "ADDRESS" "PORT" "SSH" "DEFAULT"
+      echo "$hosts" | while read -r name; do
+        local h p sp marker=""
+        h=$(jq -r --arg n "$name" '.[$n].host' "$HOSTS_FILE")
+        p=$(jq -r --arg n "$name" '.[$n].port // "8080"' "$HOSTS_FILE")
+        sp=$(jq -r --arg n "$name" '.[$n].ssh_port // "2222"' "$HOSTS_FILE")
+        [ "$name" = "$default_host" ] && marker="*"
+        printf "%-15s %-25s %-8s %-8s %s\n" "$name" "$h" "$p" "$sp" "$marker"
+      done
+      ;;
+    *)
+      echo "Usage: teleport host <add|remove|list|default> [args]"
+      exit 1
+      ;;
+  esac
+}
 
 usage() {
   cat <<EOF
-Usage: teleport <command> [options]
+Usage: teleport <command> [options] [--host <name>]
 
 Commands:
   setup                      Configure Claude auth, GitHub, git in container
@@ -23,8 +162,17 @@ Commands:
   kill <session_id>          Kill a session
   push <session_id> [msg]    Commit and push changes
   health                     Health check
+  status                     Check server, GitHub, and Claude auth
 
-Environment:
+  host add <name> <addr>     Register a host (--port, --ssh-port, --ssh-user)
+  host remove <name>         Remove a host
+  host list                  List registered hosts
+  host default [name]        Get/set default host
+
+Options:
+  --host <name>              Use a registered host (or raw address)
+
+Environment (overrides host config):
   TELEPORT_HOST       Server host (default: localhost)
   TELEPORT_PORT       API port (default: 8080)
   TELEPORT_SSH_PORT   SSH port (default: 2222)
@@ -339,13 +487,56 @@ cmd_setup() {
   ssh -t -p "$SSH_PORT" "${SSH_USER}@${HOST}" "sudo bash /app/scripts/setup.sh"
 }
 
+cmd_status() {
+  echo "Server: ${BASE_URL}"
+  echo ""
+
+  # 1. Server health
+  local health
+  health=$(curl -s --connect-timeout 5 "${BASE_URL}/health" 2>/dev/null) || {
+    echo "  Server:  UNREACHABLE"
+    return 1
+  }
+  local active
+  active=$(echo "$health" | jq -r '.sessions.active')
+  echo "  Server:  healthy ($active active sessions)"
+
+  # 2. GitHub CLI
+  local gh_status
+  gh_status=$(curl -s --connect-timeout 5 "${BASE_URL}/health/auth" 2>/dev/null) || gh_status=""
+  if [ -n "$gh_status" ]; then
+    echo "  GitHub:  $(echo "$gh_status" | jq -r '.github // "unknown"')"
+    echo "  Claude:  $(echo "$gh_status" | jq -r '.claude // "unknown"')"
+  else
+    echo "  Auth:    (auth endpoint not available)"
+  fi
+}
+
 cmd_health() {
   curl -s "${BASE_URL}/health" | jq .
 }
 
-# Main
+# Main — extract --host flag before dispatching
+_HOST_FLAG=""
+args=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --host) _HOST_FLAG="$2"; shift 2 ;;
+    *)      args+=("$1"); shift ;;
+  esac
+done
+set -- "${args[@]+"${args[@]}"}"
+
 command="${1:-}"
 shift || true
+
+# Host command doesn't need connection resolution
+if [ "$command" = "host" ]; then
+  cmd_host "$@"
+  exit 0
+fi
+
+_resolve_host
 
 case "$command" in
   setup)   cmd_setup "$@" ;;
@@ -356,6 +547,7 @@ case "$command" in
   attach)  cmd_attach "$@" ;;
   kill)    cmd_kill "$@" ;;
   push)    cmd_push "$@" ;;
+  status)  cmd_status "$@" ;;
   health)  cmd_health "$@" ;;
   *)       usage ;;
 esac

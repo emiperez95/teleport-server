@@ -39,17 +39,30 @@ export class GitService {
     }
 
     const branchArg = branch ? `-b ${branch}` : '';
-    const cmd = `git clone ${branchArg} "${repoUrl}" "${workDir}"`;
 
-    try {
-      const { stdout, stderr } = await execAsync(cmd, { timeout: 120000 });
-      if (stderr && !stderr.includes('Cloning into')) {
-        logger.warn(`Git clone warning: ${stderr}`);
+    // Try clone with gh-authenticated URL first (for private repos), fallback to plain URL
+    const authUrl = await this.getAuthenticatedUrl(repoUrl);
+    const urls = authUrl !== repoUrl ? [authUrl, repoUrl] : [repoUrl];
+
+    for (const url of urls) {
+      const cmd = `git clone ${branchArg} "${url}" "${workDir}"`;
+      try {
+        const { stdout, stderr } = await execAsync(cmd, { timeout: 120000 });
+        if (stderr && !stderr.includes('Cloning into')) {
+          logger.warn(`Git clone warning: ${stderr}`);
+        }
+        logger.info(`Clone complete: ${stdout || 'success'}`);
+        return;
+      } catch (error) {
+        if (urls.indexOf(url) < urls.length - 1) {
+          logger.warn(`Clone with authenticated URL failed, trying plain URL`);
+          // Clean up failed clone attempt
+          try { await execAsync(`rm -rf "${workDir}"`); } catch { /* ignore */ }
+          continue;
+        }
+        logger.error(`Git clone failed: ${error}`);
+        throw new Error(`Failed to clone repository: ${error}`);
       }
-      logger.info(`Clone complete: ${stdout || 'success'}`);
-    } catch (error) {
-      logger.error(`Git clone failed: ${error}`);
-      throw new Error(`Failed to clone repository: ${error}`);
     }
   }
 
@@ -128,6 +141,26 @@ export class GitService {
     }
 
     return result;
+  }
+
+  /**
+   * Get an authenticated HTTPS URL using gh CLI token
+   */
+  private async getAuthenticatedUrl(repoUrl: string): Promise<string> {
+    // Only works for HTTPS GitHub URLs
+    const match = repoUrl.match(/^https:\/\/github\.com\/(.+)$/);
+    if (!match) return repoUrl;
+
+    try {
+      const { stdout } = await execAsync('gh auth token 2>/dev/null');
+      const token = stdout.trim();
+      if (token) {
+        return `https://x-access-token:${token}@github.com/${match[1]}`;
+      }
+    } catch {
+      // gh not authenticated, return original URL
+    }
+    return repoUrl;
   }
 
   /**
